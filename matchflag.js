@@ -249,30 +249,19 @@
   }
 
   // ===== 저장: 전체/불일치/일치 =====
-  function saveThreeFiles(baseName, allRows) {
-    const passRows = allRows.filter(r => r.일치여부 === '일치');
-    const failRows = allRows.filter(r => r.일치여부 === '불일치');
+  function saveAsOneWorkbook(baseName, allRows) {
+     const passRows = allRows.filter(r => r.일치여부 === '일치');
+     const failRows = allRows.filter(r => r.일치여부 === '불일치');
 
-    // 전체
-    {
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(allRows)), 'A_전체');
-      XLSX.writeFile(wb, `${baseName}_일위대가 검사_전체.xlsx`);
-    }
-    // 불일치
-    {
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(failRows)), 'A_불일치');
-      XLSX.writeFile(wb, `${baseName}_일위대가 검사_불일치.xlsx`);
-    }
-    // 일치
-    {
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(passRows)), 'A_일치');
-      XLSX.writeFile(wb, `${baseName}_일위대가 검사_일치.xlsx`);
-    }
-  }
-
+     const wb = XLSX.utils.book_new();
+     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(allRows)), 'A_전체');
+     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(failRows)), 'A_불일치');
+     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(passRows)), 'A_일치');
+   
+     const outName = `${baseName}_일위대가 검사.xlsx`;
+     XLSX.writeFile(wb, outName);
+} 
+  
   // ===== 실행 =====
   async function run() {
     try {
@@ -289,8 +278,9 @@
       log(`일위대가 검사: 참조 ${summary.A_검사한_참조}건, 일치 ${summary.A_일치}, 불일치 ${summary.A_불일치}`);
 
       const base = f.name.replace(/\.[^.]+$/, '');
-      saveThreeFiles(base, details);
-      log('엑셀 저장 완료: _일위대가 검사_전체 / _불일치 / _일치');
+      saveAsOneWorkbook(base, details);
+      log('엑셀 저장 완료: (한 파일, 시트 3장) A_전체 / A_불일치 / A_일치');
+      
     } catch (e) {
       console.error(e);
       log(`ERROR: ${e.message || e}`);
