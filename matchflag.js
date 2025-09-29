@@ -1,21 +1,18 @@
-/* matchflag.js — GitHub Pages / 브라우저 내 처리 (SheetJS 필요)
-   구현범위 v1: A검사 완전 동작
-   - '일위대가' 시트 각 행의 수식에서 외부시트 참조 추출
-   - 현재 행 (품명|규격) 키 vs 참조된 시트의 같은 행 키 비교
-   - 일치/불일치 상세와 요약 생성 → XLSX.writeFile 로 다운로드
-   확장 훅: runChecks() 내부에 B~E를 추가 구현 가능
+/* matchflag.js v1.1
+   - 상단 Nb2 이동 버튼은 HTML에서 처리
+   - A검사 결과를 로그에 상세 출력
+   - 엑셀 3종 출력: 전체 / 불일치 / 일치
 */
 (function () {
   'use strict';
 
-  // ====== UI 로그 ======
+  // ===== 로그 유틸 =====
+  const LOG_MISMATCH_LIMIT = 200; // 로그에 찍을 최대 불일치 행수 (UI 보호)
   const log = (m) => {
     const el = document.getElementById('mfLog');
     if (!el) return;
     el.textContent += (el.textContent ? '\n' : '') + String(m);
   };
-
-  // 전역 에러 표시
   window.onerror = function (msg, url, line, col, error) {
     log([
       '=== 전역 에러 감지 ===',
@@ -27,7 +24,7 @@
     return false;
   };
 
-  // ====== SheetJS 로딩 보장 ======
+  // ===== XLSX 준비 =====
   function waitForXLSX(timeoutMs = 5000) {
     return new Promise((resolve, reject) => {
       const t0 = Date.now();
@@ -38,16 +35,9 @@
       })();
     });
   }
-
-  // ====== 파일 읽기 / 시트 변환 ======
   async function readWorkbook(file) {
     const buf = await file.arrayBuffer();
-    return XLSX.read(new Uint8Array(buf), {
-      type: 'array',
-      cellFormula: true,
-      cellNF: true,
-      cellText: true,
-    });
+    return XLSX.read(new Uint8Array(buf), { type: 'array', cellFormula: true, cellNF: true, cellText: true });
   }
   function sheetToAOA(wb, name) {
     const ws = wb.Sheets[name];
@@ -55,20 +45,8 @@
     return XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
   }
 
-  // ====== 문자열 정규화 & 숫자 ======
-  const norm = (s) =>
-    String(s == null ? '' : s)
-      .replace(/\s+/g, '')
-      .replace(/[()（）\[\]【】]/g, '')
-      .trim();
-  function toNum(x) {
-    if (x == null || x === '') return null;
-    const n = Number(String(x).replace(/,/g, ''));
-    return Number.isFinite(n) ? n : null;
-  }
-
-  // ====== 헤더 탐색 (상단 몇 행 스캔해 품명/규격 등 위치 잡기) ======
-  // 라벨 후보는 너의 NB2와 동일 개념으로 구성
+  // ===== 문자열/헤더 =====
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, '').replace(/[()（）\[\]【】]/g, '').trim();
   const LABELS = {
     품명: ['품명', '품 명'],
     규격: ['규격', '규 격', '사양', '사 양'],
@@ -78,76 +56,33 @@
     const labelSet = {};
     for (const k in LABELS) labelSet[k] = LABELS[k].map((x) => norm(x));
     const rows = Math.min(scanRows, arr.length);
-    const found = {}; // lab -> positions
-    Object.keys(labelSet).forEach((k) => (found[k] = []));
+    const found = {}; Object.keys(labelSet).forEach(k => found[k] = []);
     for (let r = 0; r < rows; r++) {
       const row = arr[r] || [];
       for (let c = 0; c < row.length; c++) {
         const v = row[c];
         if (typeof v !== 'string') continue;
         const key = norm(v);
-        for (const lab in labelSet) {
-          if (labelSet[lab].includes(key)) found[lab].push([r, c]);
-        }
+        for (const lab in labelSet) if (labelSet[lab].includes(key)) found[lab].push([r, c]);
       }
     }
-    // 헤더행: 가장 많이 히트한 r
     const rc = new Map();
-    for (const hits of Object.values(found)) {
-      for (const [r] of hits) rc.set(r, (rc.get(r) || 0) + 1);
-    }
+    for (const hits of Object.values(found)) for (const [r] of hits) rc.set(r, (rc.get(r) || 0) + 1);
     if (!rc.size) throw new Error('머리글을 찾지 못함');
-    const headerRow = [...rc.entries()].sort((a, b) => b[1] - a[1])[0][0];
-
-    function pickCol(lab) {
-      const hits = found[lab].filter(([r]) => r === headerRow);
-      return hits.length ? hits[0][1] : null;
-    }
-    const colMap = {
-      품명: pickCol('품명'),
-      규격: pickCol('규격'),
-      단위: pickCol('단위'),
-    };
-    if (colMap.품명 == null || colMap.규격 == null)
-      throw new Error('필수 컬럼(품명/규격) 미탐색');
-    return { headerRow, colMap };
+    const headerRow = [...rc.entries()].sort((a,b)=>b[1]-a[1])[0][0];
+    function pickCol(lab){ const hits = found[lab].filter(([r])=>r===headerRow); return hits.length?hits[0][1]:null; }
+    const colMap = { 품명: pickCol('품명'), 규격: pickCol('규격'), 단위: pickCol('단위') };
+    if (colMap.품명 == null || colMap.규격 == null) throw new Error('필수 컬럼(품명/규격) 미탐색');
+    return { headerRow: headerRow, colMap };
+  }
+  const buildKey = (name, spec) => norm(name) + '|' + norm(spec);
+  function isSummaryRow(rowStr) {
+    if (!rowStr) return false;
+    const s = String(rowStr);
+    return /합계|TOTAL|소계|%/.test(s);
   }
 
-  // ====== (품명|규격) 키 생성 ======
-  function buildKey(name, spec) {
-    return norm(name) + '|' + norm(spec);
-  }
-
-  // ====== 행 → 키 맵 생성 ======
-  function buildKeyMap(arr, headerRow, colMap) {
-    const map = new Map(); // key -> {r, name, spec}
-    for (let r = headerRow + 1; r < arr.length; r++) {
-      const row = arr[r] || [];
-      const name = row[colMap.품명];
-      if (name == null || String(name).trim() === '') continue;
-      const spec = row[colMap.규격] == null ? '' : row[colMap.규격];
-      const key = buildKey(name, spec);
-      if (!map.has(key)) map.set(key, { r, name, spec });
-    }
-    return map;
-  }
-
-  // ====== A1 표기 → 좌표 (A→0, 1-based row→0-based) ======
-  const A1_RE = /^(\$?)([A-Z]+)(\$?)(\d+)$/;
-  function a1ToRC(a1) {
-    const m = String(a1).match(A1_RE);
-    if (!m) return null;
-    const colLetters = m[2];
-    const row1 = parseInt(m[4], 10);
-    let col = 0;
-    for (let i = 0; i < colLetters.length; i++) {
-      col = col * 26 + (colLetters.charCodeAt(i) - 64);
-    }
-    return { r: row1 - 1, c: col - 1 };
-  }
-
-  // ====== 수식에서 외부시트 참조 추출 ======
-  // '시트 명'!A1  또는  시트명!$B$12  등
+  // ===== 수식 참조 추출 =====
   const REF_RE = /(?:'([^']+)'|([^'!]+))!([$]?[A-Z]+[$]?\d+)/g;
   function extractRefs(formula) {
     const out = [];
@@ -160,55 +95,32 @@
     }
     return out;
   }
-
-  // ====== 워크북 시트 → AOA 캐시 ======
-  function getAOA(wb, name, cache) {
-    if (cache.has(name)) return cache.get(name);
-    const arr = sheetToAOA(wb, name);
-    cache.set(name, arr);
-    return arr;
-  }
-
-  // ====== A검사 구현 ======
-  // 대상 시트: '일위대가' (없으면 가장 유사한 후보를 자동 탐색)
   function pickSheetByName(names, target) {
     if (names.includes(target)) return target;
-    // 유사 후보: 공백 제거 후 includes
     const t = norm(target);
-    let best = null;
-    for (const n of names) {
-      if (norm(n).includes(t)) {
-        best = n; break;
-      }
-    }
-    return best || target; // 없으면 그냥 target (나중에 시트없음 에러)
+    for (const n of names) if (norm(n).includes(t)) return n;
+    return target;
   }
 
-  function isSummaryRow(rowStr) {
-    if (!rowStr) return false;
-    const s = String(rowStr);
-    return /합계|TOTAL|소계|%/.test(s);
-  }
-
+  // ===== A검사 =====
   function runCheckA(wb) {
-    const details = []; // 결과 상세 행들
-    const cache = new Map(); // 시트 AOA 캐시
+    const details = [];
+    const cache = new Map();
+    const getAOA = (name) => { if (cache.has(name)) return cache.get(name); const arr = sheetToAOA(wb, name); cache.set(name, arr); return arr; };
 
     const srcName = pickSheetByName(wb.SheetNames, '일위대가');
     const srcArr = sheetToAOA(wb, srcName);
     const { headerRow: srcHdr, colMap: srcCols } = findHeaderRowAndCols(srcArr);
-    const srcKeyMap = buildKeyMap(srcArr, srcHdr, srcCols);
-
-    // 모든 셀 순회: 같은 행(r)에서 수식이 있는 셀을 스캔
     const ws = wb.Sheets[srcName];
     const range = XLSX.utils.decode_range(ws['!ref']);
+
     for (let r = srcHdr + 1; r <= range.e.r; r++) {
       const name = srcArr[r]?.[srcCols.품명];
       if (!name || isSummaryRow(name)) continue;
       const spec = srcArr[r]?.[srcCols.규격] ?? '';
       const myKey = buildKey(name, spec);
 
-      // 행 r의 모든 열에 대해 수식 셀 찾기
+      // 행 r의 수식 수집
       const refs = [];
       for (let c = range.s.c; c <= range.e.c; c++) {
         const addr = XLSX.utils.encode_cell({ r, c });
@@ -217,37 +129,24 @@
         const ex = extractRefs(cell.f);
         for (const ref of ex) refs.push({ ...ref, addr, formula: cell.f });
       }
-      if (refs.length === 0) {
-        // 외부참조가 전혀 없으면 패스(논쟁지점: 불일치로 볼지 보류)
-        continue;
-      }
+      if (refs.length === 0) continue;
 
-      // 대표 참조(최빈 시트) 계산
+      // 대표 시트(최빈)
       const bySheet = new Map();
       for (const rf of refs) bySheet.set(rf.sheet, (bySheet.get(rf.sheet) || 0) + 1);
-      const rep = [...bySheet.entries()].sort((a, b) => b[1] - a[1])[0];
+      const rep = [...bySheet.entries()].sort((a,b)=>b[1]-a[1])[0];
       const repSheet = rep ? rep[0] : refs[0].sheet;
 
-      // 대표 시트에서 같은 행 키 가져와 비교
-      let refKey = '(N/A)';
-      let refName = '', refSpec = '';
-      let ok = false, reason = '';
-
+      let refName = '', refSpec = '', ok = false, reason = '';
       try {
-        const refArr = getAOA(wb, repSheet, cache);
+        const refArr = getAOA(repSheet);
         const { headerRow: refHdr, colMap: refCols } = findHeaderRowAndCols(refArr);
         const refNameVal = refArr[r]?.[refCols.품명];
         const refSpecVal = refArr[r]?.[refCols.규격] ?? '';
         refName = refNameVal ?? '';
         refSpec = refSpecVal ?? '';
-        refKey = buildKey(refName, refSpec);
-
-        if (norm(refNameVal) === '' && norm(refSpecVal) === '') {
-          ok = false; reason = '대표시트 동일행에 품명/규격 빈값';
-        } else {
-          ok = myKey === refKey;
-          reason = ok ? '키일치' : '키불일치';
-        }
+        if (norm(refNameVal) === '' && norm(refSpecVal) === '') { ok = false; reason = '대표시트 동일행에 품명/규격 빈값'; }
+        else { ok = (myKey === buildKey(refName, refSpec)); reason = ok ? '키일치' : '키불일치'; }
       } catch (e) {
         ok = false; reason = '대표시트 해석 실패: ' + (e.message || e);
       }
@@ -255,7 +154,7 @@
       details.push({
         검사: 'A',
         시트: srcName,
-        행번호: r + 1, // 1-based
+        행번호: r + 1,
         내_품명: name,
         내_규격: spec,
         대표시트: repSheet,
@@ -266,60 +165,78 @@
       });
     }
 
-    // 요약
     const total = details.length;
-    const pass = details.filter((d) => d.키_일치 === 'TRUE').length;
+    const pass = details.filter(d => d.키_일치 === 'TRUE').length;
     const fail = total - pass;
-
     return { details, summary: { 항목: 'A', 총건수: total, 일치: pass, 불일치: fail } };
   }
 
-  // ====== 결과 통합 → 엑셀 저장 ======
+  // ===== 저장 유틸 =====
   function objectsToAOA(objs) {
     if (!objs.length) return [['결과 없음']];
     const headers = Object.keys(objs[0]);
     const aoa = [headers];
-    for (const o of objs) aoa.push(headers.map((h) => o[h]));
+    for (const o of objs) aoa.push(headers.map(h => o[h]));
     return aoa;
   }
-  function saveResultToExcel(srcFileName, results) {
-    const wbOut = XLSX.utils.book_new();
 
-    // Summary
-    const sumAoa = objectsToAOA(results.summaries);
-    XLSX.utils.book_append_sheet(wbOut, XLSX.utils.aoa_to_sheet(sumAoa), '요약');
+  function saveThreeFiles(baseName, allRows) {
+    const passRows = allRows.filter(r => r.키_일치 === 'TRUE');
+    const failRows = allRows.filter(r => r.키_일치 !== 'TRUE');
 
-    // Each detail sheet
-    for (const [name, rows] of Object.entries(results.detailByName)) {
-      const aoa = objectsToAOA(rows);
-      XLSX.utils.book_append_sheet(wbOut, XLSX.utils.aoa_to_sheet(aoa), name);
+    // 전체
+    {
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(allRows)), 'A_전체');
+      XLSX.writeFile(wb, baseName + '_A_전체.xlsx');
     }
-
-    const outName = srcFileName.replace(/\.[^.]+$/, '') + '_Matchflag_A.xlsx';
-    XLSX.writeFile(wbOut, outName);
-    log(`저장 완료: ${outName}`);
+    // 불일치
+    {
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(failRows)), 'A_불일치');
+      XLSX.writeFile(wb, baseName + '_A_불일치.xlsx');
+    }
+    // 일치
+    {
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(passRows)), 'A_일치');
+      XLSX.writeFile(wb, baseName + '_A_일치.xlsx');
+    }
   }
 
-  // ====== 실행 오케스트레이션 ======
-  function runChecks(wb) {
-    // A 검사 실행
+  // ===== 오케스트레이션 =====
+  function runChecksAndSave(wb, srcFileName) {
     const A = runCheckA(wb);
 
-    // 나중 확장(B~E) 자리
-    const summaries = [A.summary];
-    const detailByName = {
-      'A_검사': A.details,
-      // 'B_검사': B.details, ...
-    };
-    return { summaries, detailByName };
+    // 로그 출력 (요약 + 불일치 상세)
+    log(`[A] 총건수=${A.summary.총건수}, 일치=${A.summary.일치}, 불일치=${A.summary.불일치}`);
+    if (A.details.length === 0) {
+      log('[A] 상세 없음');
+    } else {
+      const fails = A.details.filter(d => d.키_일치 !== 'TRUE');
+      if (fails.length) {
+        log(`[A] 불일치 상세 (${Math.min(fails.length, LOG_MISMATCH_LIMIT)}개 표시 / 총 ${fails.length})`);
+        const sample = fails.slice(0, LOG_MISMATCH_LIMIT);
+        for (const d of sample) {
+          log(`- 행${d.행번호} [${d.사유}] 내=(${d.내_품명} | ${d.내_규격}) vs 대표(${d.대표시트})=(${d.대표_품명} | ${d.대표_규격})`);
+        }
+        if (fails.length > LOG_MISMATCH_LIMIT) log(`… 생략 ${fails.length - LOG_MISMATCH_LIMIT}건`);
+      } else {
+        log('[A] 불일치 없음 (전부 일치)');
+      }
+    }
+
+    // 파일 3종 저장
+    const base = srcFileName.replace(/\.[^.]+$/, '');
+    saveThreeFiles(base, A.details);
+    log('엑셀 저장 완료: _A_전체 / _A_불일치 / _A_일치');
   }
 
-  // ====== 버튼 핸들러 ======
+  // ===== 실행 =====
   async function run() {
     try {
       document.getElementById('mfLog').textContent = '';
-      log('초기화…');
-      await waitForXLSX();
+      log('초기화…'); await waitForXLSX();
 
       const f = document.getElementById('mfFile').files[0];
       if (!f) throw new Error('엑셀 파일을 선택하세요.');
@@ -328,19 +245,16 @@
       const wb = await readWorkbook(f);
       log('시트: ' + wb.SheetNames.join(', '));
 
-      const results = runChecks(wb);
-      log('검사 완료. 엑셀로 저장합니다…');
-      saveResultToExcel(f.name, results);
+      runChecksAndSave(wb, f.name);
       log('완료.');
     } catch (e) {
-      console.error(e);
-      log(`ERROR: ${e.message || e}\n${e.stack || ''}`);
+      console.error(e); log(`ERROR: ${e.message || e}\n${e.stack || ''}`);
     }
   }
 
-  // ====== DOM 바인딩 ======
   window.addEventListener('DOMContentLoaded', () => {
     const btn = document.getElementById('mfRun');
     if (btn) btn.addEventListener('click', run);
   });
 })();
+
