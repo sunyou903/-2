@@ -58,6 +58,35 @@
     }
     return normCommasWs(s);
   }
+   // 0) 워크시트에서 "수식 있는 셀만" 행별로 모으기
+   function buildFormulaMapByRow(ws, rowStart /* 0-based */) {
+     const byRow = new Map();
+     for (const addr in ws) {
+       if (addr[0] === '!') continue;
+       const cell = ws[addr];
+       if (!cell || !cell.f || typeof cell.f !== 'string') continue;
+       const rc = XLSX.utils.decode_cell(addr);
+       if (rc.r < rowStart) continue;
+       if (!byRow.has(rc.r)) byRow.set(rc.r, []);
+       byRow.get(rc.r).push({ f: cell.f, addr });
+     }
+     return byRow;
+   }
+   
+   // 1) 원본과 동일한 시트참조 정규식 (따옴표/비따옴표, 시트명, 열, 행)
+   const SHEET_REF_RE = /'(.*?)'!\$?([A-Z]{1,3})\$?(\d+)|([^'!]+)!\$?([A-Z]{1,3})\$?(\d+)/g;
+   
+   // 2) 가장 가까운 헤더행(최근접 위쪽 r<=행)을 찾는 헬퍼
+   function nearestHeaderRow(targetRow1Based, headerRowCandidates /* number[] 1-based */) {
+     let best = null, bestDist = Infinity;
+     for (const hr of headerRowCandidates) {
+       if (hr <= targetRow1Based) {
+         const d = targetRow1Based - hr;
+         if (d < bestDist) { bestDist = d; best = hr; }
+       }
+     }
+     return best; // 없으면 null
+   }
 
   // ===== 헤더 탐색 (필수 라벨 모두 존재하는 행 찾기; 라벨은 공백 제거 비교) =====
   function normLabel(s) {
@@ -303,319 +332,319 @@
    
    // B) 일위대가목록 검사: 목록 각 행의 수식이 '단가대비표' (또는 일위대가) 특정 행을 참조 → 키 비교
    function runCheckB(wb) {
-     const getAOA = makeAOACache(wb);
-   
      const lsName = pickSheetByName(wb.SheetNames, '일위대가목록');
-     const upName = pickSheetByName(wb.SheetNames, '단가대비표');
      const ulName = pickSheetByName(wb.SheetNames, '일위대가');
    
-     const lsArr = getAOA(lsName);
-     const upArr = getAOA(upName);
-     const ulArr = getAOA(ulName);
+     const lsArr = sheetToAOA(wb, lsName);
+     const ulArr = sheetToAOA(wb, ulName);
    
-     const lsHdr = findHeaderRowAndColsRequired(lsArr, ['품명','규격']);
-     const upHdr = findHeaderRowAndColsRequired(upArr, ['품명','규격','단위']);
-     const ulHdr = findHeaderRowAndColsRequired(ulArr, ['품명','규격','단위','수량']).headerRow; // 보조
+     // 목록/일위대가 헤더 포지션
+     const { headerRow: lsHR, pos: lsPos } = findHeaderRowAndColsRequired(lsArr, ['품명','규격']);
+     const { headerRow: ulHR, pos: ulPosFull } = findHeaderRowAndColsRequired(
+       ulArr, ['품명','규격','단위','수량','합계 단가','합계금액','합계단가','합계단가(원)'].map(s=>s) // 라벨 변형 흡수
+     );
    
-     const upPos = findHeaderRowAndColsRequired(upArr, ['품명','규격']).pos;
-     const lsPos = lsHdr.pos;
+     // 일위대가의 헤더 후보(원본은 “헤더행 후보 모음”에서 최근접 선택)
+     const ulHeaderCandidates = [ulHR]; // 필요 시 추가 후보를 여기에 넣어 확장
    
-     const upKey = buildKeyMap(upArr, upHdr.headerRow, upPos['품명'], upPos['규격']);
-     const lsKey = buildKeyMap(lsArr, lsHdr.headerRow, lsPos['품명'], lsPos['규격']);
+     // 목록 키
+     const keyOfList = (r) => `${normSimple(lsArr[r]?.[lsPos['품명']])}|${normSimple(lsArr[r]?.[lsPos['규격']])}`;
    
-     const ws = wb.Sheets[lsName];
-     const rng = XLSX.utils.decode_range(ws['!ref']);
+     // 일위대가: 특정 헤더행 기준으로 (품명|규격) 키 만들기
+     function keyFromULRowByHeader(rr1, hdr1) {
+       const r0 = rr1 - 1;
+       const name = ulArr[r0]?.[ulPosFull['품명']];
+       const spec = ulArr[r0]?.[ulPosFull['규격']];
+       return `${normSimple(name)}|${normSimple(spec)}`;
+     }
+   
+     const wsList = wb.Sheets[lsName];
+     const rng = XLSX.utils.decode_range(wsList['!ref']);
+     const formulasByRow = buildFormulaMapByRow(wsList, lsHR + 1);
    
      const records = [];
+     let checked = 0;
    
-     for (let r = lsHdr.headerRow + 1; r <= rng.e.r; r++) {
+     for (let r = lsHR + 1; r <= rng.e.r; r++) {
        const r1 = r + 1;
-       const name = lsArr[r]?.[lsPos['품명']];
-       const spec = lsArr[r]?.[lsPos['규격']];
-       if ((name ?? '') === '' && (spec ?? '') === '') continue;
+       const curKey = keyOfList(r);
+       if (curKey === "null|null" || curKey === "undefined|undefined") continue;
    
-       const cur_key = `${name ?? ''}|${spec ?? ''}`;
-       let rowHasRef = false;
+       // 이 행의 수식들만 스캔
+       const forms = formulasByRow.get(r) || [];
+       let any = false;
+       let mismatched = false;
    
-       for (let c = rng.s.c; c <= rng.e.c; c++) {
-         const addr = XLSX.utils.encode_cell({ r, c });
-         const cell = ws[addr];
-         const f = cell && typeof cell.f === 'string' ? cell.f : null;
-         if (!f) continue;
-   
-         // 어떤 시트든 참조 잡기 (A의 REF_RE는 특정 시트로 제한되어 있으니 여기선 범용)
-         // '시트명'!$A$123  or  시트명!B45
-         const REF_ANY = /'(.*?)'!\$?([A-Z]+)\$?(\d+)|([^'!]+)!\$?([A-Z]+)\$?(\d+)/g;
-         let m;
-         while ((m = REF_ANY.exec(f)) !== null) {
-           const sheet = m[1] || m[4];
+       for (const { f } of forms) {
+         let m; SHEET_REF_RE.lastIndex = 0;
+         while ((m = SHEET_REF_RE.exec(f)) !== null) {
+           const sheet = (m[1] || m[4] || '').trim().replace(/\s+/g,'');
            const rr = parseInt(m[3] || m[6], 10);
-           // 우선 대상: 단가대비표, (없으면) 일위대가
-           const target = (String(sheet).replace(/\s+/g,'').includes('단가대비표')) ? upName
-                        : (String(sheet).replace(/\s+/g,'').includes('일위대가')) ? ulName
-                        : null;
-           if (!target) continue;
+           if (!sheet.includes('일위대가')) continue; // B는 일위대가 참조만 사용
+           any = true;
    
-           const refKey = (target === upName ? upKey[rr] : (lsKey[rr] /* or ulKey[rr], 필요시 보완 */));
-           if (!refKey) continue;
+           // 최근접 헤더 선택
+           const hdr1 = nearestHeaderRow(rr, ulHeaderCandidates);
+           if (!hdr1) continue;
+           const refKey = keyFromULRowByHeader(rr, hdr1) || '';
    
-           rowHasRef = true;
-           const status = (normKey(refKey) === normKey(cur_key)) ? '일치' : '불일치';
+           checked++;
+           const status = (normKey(refKey) === normKey(curKey)) ? '일치' : '불일치';
+           if (status === '불일치') mismatched = true;
+   
            records.push({
-             "검사": "B",
+             "검사":"B",
              "시트": lsName,
              "행번호": r1,
-             "내_품명|규격": cur_key,
-             "참조시트": target,
-             "참조셀": `${target}!${(m[2]||m[5])}${rr}`,
+             "내_품명|규격": curKey,
+             "참조시트": ulName,
+             "참조셀": `${ulName}!${(m[2]||m[5])}${rr}`,
              "참조_품명|규격": refKey,
              "일치여부": status
            });
          }
        }
    
-       // 참조 전혀 없으면 스킵 (원본 B는 불일치로 보지 않음)
-       if (!rowHasRef) continue;
+       // 원본: “참조 전혀 없음”은 B에서 불일치로 치지 않음 (그대로 둠)
+       // 필요 시 ‘금액 열 직접입력’ 추가 판정 가능(원본 주석과 동일한 처리)
      }
    
      const ok = records.filter(x=>x.일치여부==='일치').length;
      const bad = records.filter(x=>x.일치여부==='불일치').length;
-     return { summary: { "B_일치": ok, "B_불일치": bad }, details: records };
+     return { summary: { "B_참조셀": checked, "B_일치": ok, "B_불일치": bad }, details: records };
    }
-   
+
    // C) 공종별내역서: 대표참조(최빈 시트) 기준 키 비교, 참조없고 '합계 단가' 직접입력되면 불일치
    function runCheckC(wb) {
-     const getAOA = makeAOACache(wb);
-   
      const wsName = pickSheetByName(wb.SheetNames, '공종별내역서');
-     const upName = pickSheetByName(wb.SheetNames, '단가대비표');
-     const ulName = pickSheetByName(wb.SheetNames, '일위대가');
-   
-     const arr = getAOA(wsName);
-     const hdr = findHeaderRowAndColsRequired(arr, ['품명','규격']); // 합계 단가 라벨은 다양해서 뒤에서 처리
-     const pos = hdr.pos;
-   
-     // 합계 단가 컬럼 추정(라벨 정규화)
+     const arr = sheetToAOA(wb, wsName);
+     const { headerRow: hr, pos } = findHeaderRowAndColsRequired(arr, ['품명','규격']);
+     // 합계 단가 후보 라벨
      let sumCol = null;
-     for (let c = 0; c < Math.min(120, (arr[hdr.headerRow]||[]).length); c++) {
-       const nv = (arr[hdr.headerRow]?.[c] ?? '');
-       const k = String(nv).replace(/[\s\u3000]/g,'');
-       if (/합계단가|합계단가\(원\)|합계단가원|총단가/.test(k)) { sumCol = c; break; }
+     for (let c = 0; c < (arr[hr]||[]).length; c++) {
+       const k = String(arr[hr]?.[c] ?? '').replace(/[\s\u3000]/g,'');
+       if (/합계단가|합계단가\(원\)|총단가|합계금액/.test(k)) { sumCol = c; break; }
      }
-   
-     const upArr = getAOA(upName);
-     const upPos = findHeaderRowAndColsRequired(upArr, ['품명','규격']).pos;
-     const upKey = buildKeyMap(upArr, findHeaderRowAndColsRequired(upArr, ['품명','규격']).headerRow, upPos['품명'], upPos['규격']);
-   
      const ws = wb.Sheets[wsName];
      const rng = XLSX.utils.decode_range(ws['!ref']);
+     const formulasByRow = buildFormulaMapByRow(ws, hr + 1);
+   
      const records = [];
+     let withDirectRefs = 0, directValMismatch = 0;
    
-     for (let r = hdr.headerRow + 1; r <= rng.e.r; r++) {
+     const keyOf = (r) => `${normSimple(arr[r]?.[pos['품명']])}|${normSimple(arr[r]?.[pos['규격']])}`;
+   
+     for (let r = hr + 1; r <= rng.e.r; r++) {
        const r1 = r + 1;
-       const name = arr[r]?.[pos['품명']];
-       const spec = arr[r]?.[pos['규격']];
-       if ((name ?? '') === '' && (spec ?? '') === '') continue;
-       const cur_key = `${name ?? ''}|${spec ?? ''}`;
-       let rowHasRef = false;
-       const refSheets = new Map();
+       const curKey = keyOf(r);
+       if (curKey === 'null|null' || curKey === 'undefined|undefined') continue;
    
-       for (let c = rng.s.c; c <= rng.e.c; c++) {
-         const addr = XLSX.utils.encode_cell({ r, c });
-         const f = ws[addr]?.f;
-         if (!f) continue;
-   
-         const REF_ANY = /'(.*?)'!\$?([A-Z]+)\$?(\d+)|([^'!]+)!\$?([A-Z]+)\$?(\d+)/g;
-         let m;
-         while ((m = REF_ANY.exec(f)) !== null) {
-           const sheet = m[1] || m[4];
-           refSheets.set(sheet, (refSheets.get(sheet) || 0) + 1);
-           rowHasRef = true;
+       const forms = formulasByRow.get(r) || [];
+       const refPairs = [];
+       for (const { f } of forms) {
+         let m; SHEET_REF_RE.lastIndex = 0;
+         while ((m = SHEET_REF_RE.exec(f)) !== null) {
+           const sheet = (m[1] || m[4] || '').trim().replace(/\s+/g,'');
+           const rr = parseInt(m[3] || m[6], 10);
+           if (!sheet || sheet === wsName) continue; // 자기 시트 제외
+           refPairs.push([sheet, rr]);
          }
        }
    
-       if (!rowHasRef) {
-         // 합계 단가 직접입력(값 있음) → 불일치
+       if (refPairs.length) {
+         withDirectRefs++;
+         // 대표 (시트,행) = 최빈
+         const counter = new Map();
+         for (const k of refPairs) counter.set(k.toString(), (counter.get(k.toString())||0)+1);
+         const [repKeyStr] = [...counter.entries()].sort((a,b)=>b[1]-a[1])[0];
+         const [repSheet, repRowStr] = repKeyStr.split(',');
+         const repRow = parseInt(repRowStr, 10);
+   
+         // 대표 참조 시트의 (품명|규격)
+         let refKey = '';
+         try {
+           const tarArr = sheetToAOA(wb, repSheet);
+           const { headerRow: th, pos: tpos } = findHeaderRowAndColsRequired(tarArr, ['품명','규격']);
+           refKey = `${normSimple(tarArr[repRow-1]?.[tpos['품명']])}|${normSimple(tarArr[repRow-1]?.[tpos['규격']])}`;
+         } catch (_) {}
+   
+         const status = (normKey(refKey) === normKey(curKey)) ? '일치' : '불일치';
+         records.push({
+           "검사":"C","시트":wsName,"행번호":r1,
+           "내_품명|규격":curKey,"대표참조_시트":repSheet,"대표참조_행":repRow,
+           "대표참조_품명|규격":refKey,"일치여부":status
+         });
+       } else {
+         // 참조 전혀 없고 합계단가 셀에 값이 있으면 불일치(값 직접입력)
          if (sumCol != null) {
            const val = arr[r]?.[sumCol];
            if (!(val == null || val === '' || val === 0)) {
+             directValMismatch++;
              records.push({
-               "검사":"C", "시트":wsName, "행번호":r1,
-               "내_품명|규격":cur_key, "참조시트":"",
-               "참조셀":"", "참조_품명|규격":"",
-               "일치여부":"불일치"
+               "검사":"C","시트":wsName,"행번호":r1,
+               "내_품명|규격":curKey,"대표참조_시트":"","대표참조_행":"",
+               "대표참조_품명|규격":"","일치여부":"불일치"
              });
            }
          }
-         continue;
        }
-   
-       // 대표시트(최빈)
-       const rep = [...refSheets.entries()].sort((a,b)=>b[1]-a[1])[0][0];
-       const repName = String(rep).replace(/\s+/g,'');
-       // 단가대비표만 비교 (원본은 여러 후보 중 우선순위 설정, 여기선 upName 우선)
-       const target = repName.includes('단가대비표') ? upName : upName;
-   
-       // 참조된 "행번호(rr)"를 하나만 대표 추출 (최초 발견 rr)
-       let rr = null, colA = null;
-       const REF_ANY2 = /'(.*?)'!\$?([A-Z]+)\$?(\d+)|([^'!]+)!\$?([A-Z]+)\$?(\d+)/g;
-       for (let c = rng.s.c; c <= rng.e.c && rr==null; c++) {
-         const addr = XLSX.utils.encode_cell({ r, c });
-         const f = ws[addr]?.f;
-         if (!f) continue;
-         let m;
-         REF_ANY2.lastIndex = 0;
-         while ((m = REF_ANY2.exec(f)) !== null) {
-           const sheet = (m[1] || m[4] || '').replace(/\s+/g,'');
-           if (sheet.includes('단가대비표')) { rr = parseInt(m[3] || m[6], 10); colA = (m[2]||m[5]); break; }
-         }
-       }
-   
-       let status = '불일치', refKey = '';
-       if (rr != null) {
-         refKey = upKey[rr] || '';
-         if (refKey) status = (normKey(refKey) === normKey(cur_key)) ? '일치' : '불일치';
-       }
-   
-       records.push({
-         "검사":"C","시트":wsName,"행번호":r1,
-         "내_품명|규격":cur_key,"참조시트":target,
-         "참조셀": rr? `${target}!${colA||'A'}${rr}` : "",
-         "참조_품명|규격": refKey,
-         "일치여부": status
-       });
      }
    
      const ok = records.filter(x=>x.일치여부==='일치').length;
      const bad = records.filter(x=>x.일치여부==='불일치').length;
-     return { summary: { "C_일치": ok, "C_불일치": bad }, details: records };
+     return { summary: {
+         "C_검사대상_행수(직접참조 보유)": withDirectRefs,
+         "C_일치": ok,
+         "C_불일치": bad,
+         "C_값직접입력_불일치": directValMismatch
+       }, details: records };
    }
-   
+
    // D) 공종별집계표: 재/노/경 단가 수식 → 참조행의 '품명'만 비교(완화)
    function runCheckD(wb) {
-     const getAOA = makeAOACache(wb);
+     const sSum = pickSheetByName(wb.SheetNames, '공종별집계표');
+     const arr = sheetToAOA(wb, sSum);
+     const { headerRow: hr, pos } = findHeaderRowAndColsRequired(arr, ['품명']); // 품명만 필수
    
-     const wsName = pickSheetByName(wb.SheetNames, '공종별집계표');
-     const upName = pickSheetByName(wb.SheetNames, '단가대비표');
-   
-     const arr = getAOA(wsName);
-     // 품명만 필수
-     const hdr = findHeaderRowAndColsRequired(arr, ['품명']);
-     const pos = hdr.pos;
-   
-     const upArr = getAOA(upName);
-     const upHdr = findHeaderRowAndColsRequired(upArr, ['품명','규격']);
-     const upPos = upHdr.pos;
-   
-     // upName의 (행→품명) 맵
-     const upNameMap = {};
-     for (let r=upHdr.headerRow+1; r<upArr.length; r++) {
-       const n = upArr[r]?.[upPos['품명']];
-       if (n != null) upNameMap[r+1] = String(n).trim();
+     // 재/노/경 단가 열 감지
+     const targets = [];
+     for (let c=0; c<(arr[hr]||[]).length; c++) {
+       const k = String(arr[hr]?.[c] ?? '').replace(/[\s\u3000]/g,'');
+       if (/재료비적용단가|노무비|경비적용단가|경비단가/.test(k)) targets.push([k,c]);
      }
-   
-     const ws = wb.Sheets[wsName];
+     const ws = wb.Sheets[sSum];
      const rng = XLSX.utils.decode_range(ws['!ref']);
-     const records = [];
+     const formulasByRow = buildFormulaMapByRow(ws, hr + 1);
    
-     for (let r=hdr.headerRow+1; r<=rng.e.r; r++) {
-       const r1 = r+1;
-       const curName = (arr[r]?.[pos['품명']] ?? '').toString().trim();
+     const records = [];
+     let checked = 0;
+   
+     const nameOf = (r) => String(arr[r]?.[pos['품명']] ?? '').trim();
+   
+     for (let r = hr + 1; r <= rng.e.r; r++) {
+       const r1 = r + 1;
+       const curName = nameOf(r);
        if (!curName) continue;
    
-       // 행 내 수식에서 upName 참조 rr 하나만 대표 추출
-       let rr = null, colA=null;
-       const REF_ANY = /'(.*?)'!\$?([A-Z]+)\$?(\d+)|([^'!]+)!\$?([A-Z]+)\$?(\d+)/g;
-       for (let c=rng.s.c; c<=rng.e.c && rr==null; c++) {
-         const f = ws[XLSX.utils.encode_cell({r,c})]?.f;
-         if (!f) continue;
-         let m; REF_ANY.lastIndex=0;
-         while ((m=REF_ANY.exec(f))!==null) {
-           const sheet = (m[1]||m[4]||'').replace(/\s+/g,'');
-           if (sheet.includes('단가대비표')) { rr = parseInt(m[3]||m[6],10); colA=(m[2]||m[5]); break; }
+       // 이 행의 대상 열들 중 수식에서 외부 참조 수집
+       const refPairs = [];
+       const forms = formulasByRow.get(r) || [];
+       for (const { f } of forms) {
+         let m; SHEET_REF_RE.lastIndex = 0;
+         while ((m = SHEET_REF_RE.exec(f)) !== null) {
+           const sheet = (m[1] || m[4] || '').trim().replace(/\s+/g,'');
+           const rr = parseInt(m[3] || m[6], 10);
+           if (!sheet || sheet === sSum) continue;
+           refPairs.push([sheet, rr]); checked++;
          }
        }
    
-       let refName = '', status='불일치';
-       if (rr!=null) {
-         refName = upNameMap[rr] || '';
-         if (refName) status = (normCommasWs(refName) === normCommasWs(curName)) ? '일치' : '불일치';
+       let repSheet=null, repRow=null, refName='';
+       if (refPairs.length) {
+         const counter = new Map();
+         for (const k of refPairs) counter.set(k.toString(), (counter.get(k.toString())||0)+1);
+         const [repKeyStr] = [...counter.entries()].sort((a,b)=>b[1]-a[1])[0];
+         const [s, rrStr] = repKeyStr.split(','); repSheet = s; repRow = parseInt(rrStr,10);
+   
+         try {
+           const tarArr = sheetToAOA(wb, repSheet);
+           const { headerRow: th, pos: tpos } = findHeaderRowAndColsRequired(tarArr, ['품명']);
+           refName = String(tarArr[repRow-1]?.[tpos['품명']] ?? '').trim();
+         } catch (_) {}
        }
    
+       const status = (normCommasWs(refName) === normCommasWs(curName)) ? '일치' : '불일치';
        records.push({
-         "검사":"D","시트":wsName,"행번호":r1,
-         "내_품명":curName,"참조시트":upName,
-         "참조셀": rr? `${upName}!${colA||'A'}${rr}` : "",
-         "참조_품명": refName,
-         "일치여부": status
+         "검사":"D","시트":sSum,"행번호":r1,
+         "내_품명":curName,"대표참조_시트":repSheet,"대표참조_행":repRow,
+         "참조_품명":refName,"일치여부":status
        });
      }
    
      const ok = records.filter(x=>x.일치여부==='일치').length;
      const bad = records.filter(x=>x.일치여부==='불일치').length;
-     return { summary: { "D_일치": ok, "D_불일치": bad }, details: records };
+     return { summary: { "D_참조셀": checked, "D_일치": ok, "D_불일치": bad }, details: records };
    }
-   
+
    // E) 단가대비표: 재료비 적용단가/노무비 수식의 참조 행매칭 (장비 단가산출서 등을 참조해도 rr로 비교)
    function runCheckE(wb) {
-     const getAOA = makeAOACache(wb);
+     const sDv = pickSheetByName(wb.SheetNames, '단가대비표');
+     const dvArr = sheetToAOA(wb, sDv);
+     const { headerRow: hr, pos } = findHeaderRowAndColsRequired(dvArr, ['품명','규격']);
    
-     const upName = pickSheetByName(wb.SheetNames, '단가대비표');
-     const upArr = getAOA(upName);
-     // 최소 라벨
-     const upHdr = findHeaderRowAndColsRequired(upArr, ['품명','규격']);
-     const upPos = upHdr.pos;
-     const upKey = buildKeyMap(upArr, upHdr.headerRow, upPos['품명'], upPos['규격']);
+     const nameCol = pos['품명'], specCol = pos['규격'];
    
-     const ws = wb.Sheets[upName];
-     const rng = XLSX.utils.decode_range(ws['!ref']);
-     const records = [];
-   
-     // 대상 컬럼 후보: "재료비 적용단가", "노무비", (필요시 "경비 적용단가")
-     const targetCols = [];
-     for (let c=0; c<Math.min(120, (upArr[upHdr.headerRow]||[]).length); c++) {
-       const k = String(upArr[upHdr.headerRow]?.[c] ?? '').replace(/[\s\u3000]/g,'');
-       if (/재료비적용단가|노무비|경비적용단가/.test(k)) targetCols.push(c);
+     // 대상 열 찾기
+     const cCols = [];
+     for (let c=0; c<(dvArr[hr]||[]).length; c++) {
+       const k = String(dvArr[hr]?.[c] ?? '').replace(/[\s\u3000]/g,'');
+       if (/재료비적용단가|노무비|경비적용단가/.test(k)) cCols.push([c,k]);
      }
    
-     const REF_ANY = /'(.*?)'!\$?([A-Z]+)\$?(\d+)|([^'!]+)!\$?([A-Z]+)\$?(\d+)/g;
+     // 특정 시트면 (품명|사양) 우선
+     function keyFromTargetSheet(arr, rr1) {
+       // 시트별 헤더 조합 후보
+       const candidates = [
+         ['품명','사양'],
+         ['품명','규격'],
+         ['품평','사양'],
+         ['품평','규격']
+       ];
+       for (const [h1,h2] of candidates) {
+         try {
+           const { headerRow: th, pos: p } = findHeaderRowAndColsRequired(arr, [h1, h2]);
+           const name = normSimple(arr[rr1-1]?.[p[h1]]);
+           const spec = normSimple(arr[rr1-1]?.[p[h2]]);
+           if (name || spec) return { key: `${name}|${spec}`, used: `${h1}|${h2}` };
+         } catch(_) {}
+       }
+       return { key: '', used: null };
+     }
    
-     for (let r=upHdr.headerRow+1; r<=rng.e.r; r++) {
-       const r1=r+1;
-       const name = upArr[r]?.[upPos['품명']];
-       const spec = upArr[r]?.[upPos['규격']];
-       if ((name ?? '')==='' && (spec ?? '')==='') continue;
-       const cur_key = `${name ?? ''}|${spec ?? ''}`;
+     const ws = wb.Sheets[sDv];
+     const rng = XLSX.utils.decode_range(ws['!ref']);
+     const formulasByRow = buildFormulaMapByRow(ws, hr + 1);
    
-       let listed = false;
+     const records = [];
    
-       for (const tc of targetCols) {
-         const addr = XLSX.utils.encode_cell({r, c: tc});
-         const f = ws[addr]?.f;
-         if (!f) continue;
+     for (let r = hr + 1; r <= rng.e.r; r++) {
+       const r1 = r + 1;
+       const baseKey = `${normSimple(dvArr[r]?.[nameCol])}|${normSimple(dvArr[r]?.[specCol])}`;
+       if (baseKey === 'null|null' || baseKey === 'undefined|undefined') continue;
    
-         let rr = null, sheetName="", colA=null;
-         let m; REF_ANY.lastIndex=0;
-         while ((m=REF_ANY.exec(f))!==null) {
-           sheetName = (m[1]||m[4]||''); rr = parseInt(m[3]||m[6],10); colA=(m[2]||m[5]); break;
+       // 대상 열 중 수식이 있는 것만
+       const forms = formulasByRow.get(r) || [];
+       for (const { f } of forms) {
+         // 외부 참조 수집(자기 시트 제외)
+         let rr = null, sheetName = '', colA = null;
+         let m; SHEET_REF_RE.lastIndex = 0;
+         while ((m = SHEET_REF_RE.exec(f)) !== null) {
+           const sheet = (m[1] || m[4] || '').trim();
+           if (!sheet || sheet === sDv) continue;
+           sheetName = sheet; rr = parseInt(m[3] || m[6], 10); colA = (m[2] || m[5]);
+           break; // 대표 1개만
          }
-         if (rr==null) continue;
+         if (!rr) continue;
    
-         const refKey = upKey[rr] || ''; // 동일 시트 참조도 허용(장비 단가산출서 등 다른 시트여도 rr키 비교는 동일 방식)
-         const status = refKey ? ((normKey(refKey)===normKey(cur_key)) ? '일치':'불일치') : '불일치';
+         // 대상 시트 로드
+         let refKey = '', usedHdr = null;
+         try {
+           const tarArr = sheetToAOA(wb, sheetName);
+           const { key, used } = keyFromTargetSheet(tarArr, rr);
+           refKey = key; usedHdr = used;
+         } catch(_) {}
    
+         const status = refKey ? ((normKey(refKey) === normKey(baseKey)) ? '일치' : '불일치') : '불일치';
          records.push({
-           "검사":"E","시트":upName,"행번호":r1,
-           "내_품명|규격":cur_key,"참조시트":sheetName,
+           "검사":"E","시트":sDv,"행번호":r1,
+           "내_품명|규격": baseKey,
+           "참조시트": sheetName,
            "참조셀": `${sheetName}!${colA||'A'}${rr}`,
            "참조_품명|규격": refKey,
+           "참조키_사용헤더": usedHdr,
            "일치여부": status
          });
-         listed = true;
        }
-   
-       // 대상 컬럼들에 수식이 전혀 없으면 스킵
-       if (!listed) continue;
      }
    
      const ok = records.filter(x=>x.일치여부==='일치').length;
@@ -626,12 +655,11 @@
   // ===== 실행 =====
    const base = f.name.replace(/\.[^.]+$/, '');
 
-   const A = runCheckA(wb);
-   const B = runCheckB(wb);
-   const C = runCheckC(wb);
-   const D = runCheckD(wb);
+   const A = runCheckA(wb); await new Promise(r=>setTimeout(r,0));
+   const B = runCheckB(wb); await new Promise(r=>setTimeout(r,0));
+   const C = runCheckC(wb); await new Promise(r=>setTimeout(r,0));
+   const D = runCheckD(wb); await new Promise(r=>setTimeout(r,0));
    const E = runCheckE(wb);
-   
    // 로그는 요약만
    log(`[A] 일치 ${A.summary.A_일치}, 불일치 ${A.summary.A_불일치}`);
    log(`[B] 일치 ${B.summary.B_일치}, 불일치 ${B.summary.B_불일치}`);
