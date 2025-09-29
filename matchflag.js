@@ -1,26 +1,22 @@
-/* matchflag.js v1.1
-   - 상단 Nb2 이동 버튼은 HTML에서 처리
-   - A검사 결과를 로그에 상세 출력
-   - 엑셀 3종 출력: 전체 / 불일치 / 일치
+/* matchflag.js v1.2 — A검사: 파이썬 로직과 동등화
+   - 로그: 요약만 출력
+   - 출력: 전체 / 불일치 / 일치 3종 XLSX
+   - 핵심 로직:
+     * '일위대가' 각 행의 수식에서 '단가대비표' 또는 '일위대가목록' 참조 추출
+     * 참조된 셀의 '행번호(rr)'를 사용하여 해당 시트의 (품명|규격) 키를 가져와 현재 행 키와 비교
+     * 참조가 전혀 없으면 '수량' 값 직입 여부 판단 → 불일치(단, % 포함 시 ‘제외’)
 */
+
 (function () {
   'use strict';
 
-  // ===== 로그 유틸 =====
-  const LOG_MISMATCH_LIMIT = 200; // 로그에 찍을 최대 불일치 행수 (UI 보호)
+  // ===== 로그 =====
   const log = (m) => {
     const el = document.getElementById('mfLog');
-    if (!el) return;
-    el.textContent += (el.textContent ? '\n' : '') + String(m);
+    if (el) el.textContent += (el.textContent ? '\n' : '') + String(m);
   };
   window.onerror = function (msg, url, line, col, error) {
-    log([
-      '=== 전역 에러 감지 ===',
-      '메시지: ' + msg,
-      '파일: ' + url,
-      '줄/컬럼: ' + line + ':' + col,
-      '오브젝트: ' + (error && error.stack ? error.stack : error),
-    ].join('\n'));
+    log(`ERROR: ${msg} @ ${url}:${line}:${col}`);
     return false;
   };
 
@@ -45,133 +41,77 @@
     return XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
   }
 
-  // ===== 문자열/헤더 =====
-  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, '').replace(/[()（）\[\]【】]/g, '').trim();
-  const LABELS = {
-    품명: ['품명', '품 명'],
-    규격: ['규격', '규 격', '사양', '사 양'],
-    단위: ['단위'],
-  };
-  function findHeaderRowAndCols(arr, scanRows = 8) {
-    const labelSet = {};
-    for (const k in LABELS) labelSet[k] = LABELS[k].map((x) => norm(x));
-    const rows = Math.min(scanRows, arr.length);
-    const found = {}; Object.keys(labelSet).forEach(k => found[k] = []);
-    for (let r = 0; r < rows; r++) {
+  // ===== 정규화 =====
+  const normSimple = (s) => (s == null ? null : String(s).trim());
+  function normCommasWs(s) {
+    if (s == null) return '';
+    let t = String(s).replace(/,/g, ' ');
+    t = t.replace(/\s+/g, ' ').trim();
+    return t;
+  }
+  function normKey(key) {
+    if (key == null) return '';
+    const s = String(key);
+    if (s.includes('|')) {
+      const [a, b] = s.split('|', 1 + 1);
+      return `${normCommasWs(a)}|${normCommasWs(b)}`;
+    }
+    return normCommasWs(s);
+  }
+
+  // ===== 헤더 탐색 (필수 라벨 모두 존재하는 행 찾기; 라벨은 공백 제거 비교) =====
+  function normLabel(s) {
+    if (s == null) return null;
+    return String(s).replace(/[\u3000 ]/g, '').trim();
+  }
+  function findHeaderRowAndColsRequired(arr, required, scanRows = 40, scanCols = 200) {
+    const req = new Set(required.map(normLabel));
+    for (let r = 0; r < Math.min(scanRows, arr.length); r++) {
+      const found = new Map();
       const row = arr[r] || [];
-      for (let c = 0; c < row.length; c++) {
-        const v = row[c];
-        if (typeof v !== 'string') continue;
-        const key = norm(v);
-        for (const lab in labelSet) if (labelSet[lab].includes(key)) found[lab].push([r, c]);
+      for (let c = 0; c < Math.min(scanCols, row.length); c++) {
+        const nv = normLabel(row[c]);
+        for (const want of req) {
+          if (nv === want && !found.has(want)) found.set(want, c);
+        }
+      }
+      if (found.size === req.size) {
+        const pos = {};
+        // map back to original labels
+        for (const lab of required) {
+          const k = normLabel(lab);
+          pos[lab] = found.get(k);
+        }
+        return { headerRow: r, pos };
       }
     }
-    const rc = new Map();
-    for (const hits of Object.values(found)) for (const [r] of hits) rc.set(r, (rc.get(r) || 0) + 1);
-    if (!rc.size) throw new Error('머리글을 찾지 못함');
-    const headerRow = [...rc.entries()].sort((a,b)=>b[1]-a[1])[0][0];
-    function pickCol(lab){ const hits = found[lab].filter(([r])=>r===headerRow); return hits.length?hits[0][1]:null; }
-    const colMap = { 품명: pickCol('품명'), 규격: pickCol('규격'), 단위: pickCol('단위') };
-    if (colMap.품명 == null || colMap.규격 == null) throw new Error('필수 컬럼(품명/규격) 미탐색');
-    return { headerRow: headerRow, colMap };
-  }
-  const buildKey = (name, spec) => norm(name) + '|' + norm(spec);
-  function isSummaryRow(rowStr) {
-    if (!rowStr) return false;
-    const s = String(rowStr);
-    return /합계|TOTAL|소계|%/.test(s);
+    throw new Error(`헤더 라벨 탐색 실패: ${required.join(',')}`);
   }
 
-  // ===== 수식 참조 추출 =====
-  const REF_RE = /(?:'([^']+)'|([^'!]+))!([$]?[A-Z]+[$]?\d+)/g;
-  function extractRefs(formula) {
-    const out = [];
-    if (typeof formula !== 'string') return out;
-    let m;
-    while ((m = REF_RE.exec(formula)) !== null) {
-      const sheet = m[1] || m[2];
-      const a1 = m[3];
-      out.push({ sheet, a1 });
+  // ===== 키맵 (1-based 행번호 -> "품명|규격") =====
+  function buildKeyMap(arr, headerRow, colName, colSpec) {
+    const map = {};
+    for (let r = headerRow + 1; r < arr.length; r++) {
+      const name = normSimple(arr[r]?.[colName]);
+      const spec = normSimple(arr[r]?.[colSpec]);
+      if ((name == null || name === '') && (spec == null || spec === '')) continue;
+      const rr = r + 1; // 1-based
+      map[rr] = `${name ?? ''}|${spec ?? ''}`;
     }
-    return out;
-  }
-  function pickSheetByName(names, target) {
-    if (names.includes(target)) return target;
-    const t = norm(target);
-    for (const n of names) if (norm(n).includes(t)) return n;
-    return target;
+    return map;
   }
 
-  // ===== A검사 =====
-  function runCheckA(wb) {
-    const details = [];
-    const cache = new Map();
-    const getAOA = (name) => { if (cache.has(name)) return cache.get(name); const arr = sheetToAOA(wb, name); cache.set(name, arr); return arr; };
-
-    const srcName = pickSheetByName(wb.SheetNames, '일위대가');
-    const srcArr = sheetToAOA(wb, srcName);
-    const { headerRow: srcHdr, colMap: srcCols } = findHeaderRowAndCols(srcArr);
-    const ws = wb.Sheets[srcName];
-    const range = XLSX.utils.decode_range(ws['!ref']);
-
-    for (let r = srcHdr + 1; r <= range.e.r; r++) {
-      const name = srcArr[r]?.[srcCols.품명];
-      if (!name || isSummaryRow(name)) continue;
-      const spec = srcArr[r]?.[srcCols.규격] ?? '';
-      const myKey = buildKey(name, spec);
-
-      // 행 r의 수식 수집
-      const refs = [];
-      for (let c = range.s.c; c <= range.e.c; c++) {
-        const addr = XLSX.utils.encode_cell({ r, c });
-        const cell = ws[addr];
-        if (!cell || !cell.f) continue;
-        const ex = extractRefs(cell.f);
-        for (const ref of ex) refs.push({ ...ref, addr, formula: cell.f });
-      }
-      if (refs.length === 0) continue;
-
-      // 대표 시트(최빈)
-      const bySheet = new Map();
-      for (const rf of refs) bySheet.set(rf.sheet, (bySheet.get(rf.sheet) || 0) + 1);
-      const rep = [...bySheet.entries()].sort((a,b)=>b[1]-a[1])[0];
-      const repSheet = rep ? rep[0] : refs[0].sheet;
-
-      let refName = '', refSpec = '', ok = false, reason = '';
-      try {
-        const refArr = getAOA(repSheet);
-        const { headerRow: refHdr, colMap: refCols } = findHeaderRowAndCols(refArr);
-        const refNameVal = refArr[r]?.[refCols.품명];
-        const refSpecVal = refArr[r]?.[refCols.규격] ?? '';
-        refName = refNameVal ?? '';
-        refSpec = refSpecVal ?? '';
-        if (norm(refNameVal) === '' && norm(refSpecVal) === '') { ok = false; reason = '대표시트 동일행에 품명/규격 빈값'; }
-        else { ok = (myKey === buildKey(refName, refSpec)); reason = ok ? '키일치' : '키불일치'; }
-      } catch (e) {
-        ok = false; reason = '대표시트 해석 실패: ' + (e.message || e);
-      }
-
-      details.push({
-        검사: 'A',
-        시트: srcName,
-        행번호: r + 1,
-        내_품명: name,
-        내_규격: spec,
-        대표시트: repSheet,
-        대표_품명: refName,
-        대표_규격: refSpec,
-        키_일치: ok ? 'TRUE' : 'FALSE',
-        사유: reason,
-      });
-    }
-
-    const total = details.length;
-    const pass = details.filter(d => d.키_일치 === 'TRUE').length;
-    const fail = total - pass;
-    return { details, summary: { 항목: 'A', 총건수: total, 일치: pass, 불일치: fail } };
+  // ===== 합계/소계 등 제외 규칙 (원본 A와 동일) =====
+  function isSumRow(nameCell) {
+    if (!nameCell) return false;
+    const t = String(nameCell);
+    return t.includes('합') && t.includes('계') && t.includes('[') && t.includes(']');
   }
 
-  // ===== 저장 유틸 =====
+  // ===== 수식 참조 추출:  '단가대비표' / '일위대가목록' ! $A$123 =====
+  const REF_RE = /(?:'?)((?:단가대비표)|(?:일위대가목록))(?:'?)!\$?([A-Z]{1,3})\$?(\d+)/g;
+
+  // ===== 객체 배열→AOA =====
   function objectsToAOA(objs) {
     if (!objs.length) return [['결과 없음']];
     const headers = Object.keys(objs[0]);
@@ -180,75 +120,180 @@
     return aoa;
   }
 
+  // ===== A검사 =====
+  function runCheckA(wb) {
+    const srcName = pickSheetByName(wb.SheetNames, '일위대가');
+    const upName  = pickSheetByName(wb.SheetNames, '단가대비표');
+    const lsName  = pickSheetByName(wb.SheetNames, '일위대가목록');
+
+    const ulArr = sheetToAOA(wb, srcName);
+    const upArr = sheetToAOA(wb, upName);
+    const lsArr = sheetToAOA(wb, lsName);
+
+    const ulHdr = findHeaderRowAndColsRequired(ulArr, ['품명','규격','단위','수량']);
+    const upHdr = findHeaderRowAndColsRequired(upArr, ['품명','규격','단위']);
+    const lsHdr = findHeaderRowAndColsRequired(lsArr, ['품명','규격']);
+
+    const ulPos = ulHdr.pos, upPos = upHdr.pos, lsPos = lsHdr.pos;
+
+    const ulKey = buildKeyMap(ulArr, ulHdr.headerRow, ulPos['품명'], ulPos['규격']);
+    const upKey = buildKeyMap(upArr, upHdr.headerRow, upPos['품명'], upPos['규격']);
+    const lsKey = buildKeyMap(lsArr, lsHdr.headerRow, lsPos['품명'], lsPos['규격']);
+
+    const ws = wb.Sheets[srcName];
+    const rng = XLSX.utils.decode_range(ws['!ref']);
+
+    const records = [];
+    let checked = 0;
+
+    for (let r = ulHdr.headerRow + 1; r <= rng.e.r; r++) {
+      const r1 = r + 1; // 1-based
+      const cur_key = ulKey[r1];
+      const nameCell = ulArr[r]?.[ulPos['품명']];
+      if (!cur_key || isSumRow(nameCell)) continue;
+
+      const specCell = ulArr[r]?.[ulPos['규격']];
+      const pname_cur = normSimple(nameCell);
+      const gname_cur = normSimple(specCell);
+
+      let rowHasRef = false;
+
+      // --- 이 행의 모든 셀에서 수식 검사 ---
+      for (let c = rng.s.c; c <= rng.e.c; c++) {
+        const addr = XLSX.utils.encode_cell({ r, c });
+        const cell = ws[addr];
+        const f = cell && typeof cell.f === 'string' ? cell.f : null;
+        if (!f) continue;
+        if (!f.includes('단가대비표') && !f.includes('일위대가목록')) continue;
+
+        let m;
+        REF_RE.lastIndex = 0;
+        while ((m = REF_RE.exec(f)) !== null) {
+          const sheet_name = m[1];
+          const colLetters = m[2];
+          const rr = parseInt(m[3], 10); // 참조된 '행번호'
+
+          const ref_key = sheet_name.startsWith('단가대비표') ? upKey[rr] : lsKey[rr];
+          if (!ref_key) continue;
+
+          checked += 1;
+          let status = (normKey(ref_key) === normKey(cur_key)) ? '일치' : '불일치';
+
+          // % 포함 시 불일치 → 제외
+          try {
+            if (status === '불일치' && ((pname_cur && String(pname_cur).includes('%')) || (gname_cur && String(gname_cur).includes('%')))) {
+              status = '제외';
+            }
+          } catch (_) {}
+
+          const shortF = f.length > 140 ? f.slice(0, 140) + '...' : f;
+
+          records.push({
+            "일위대가_행": r1,
+            "일위대가_품명|규격": cur_key,
+            "참조시트": sheet_name,
+            "참조셀": `${sheet_name}!${colLetters}${rr}`,
+            "참조_품명|규격": ref_key,
+            "수식_셀": addr,
+            "수식_일부": shortF,
+            "일치여부": status
+          });
+          rowHasRef = true;
+        }
+      }
+
+      // --- 참조가 전혀 없으면: '수량' 값 직접입력 여부 검사 ---
+      if (!rowHasRef) {
+        const qtyCol = ulPos['수량'];
+        const val = ulArr[r]?.[qtyCol];
+        if (!(val == null || val === '' || val === 0)) {
+          let status_di = '불일치';
+          try {
+            if ((pname_cur && String(pname_cur).includes('%')) || (gname_cur && String(gname_cur).includes('%'))) {
+              status_di = '제외';
+            }
+          } catch (_) {}
+
+          records.push({
+            "일위대가_행": r1,
+            "일위대가_품명|규격": cur_key,
+            "참조시트": "",
+            "참조셀": "",
+            "참조_품명|규격": "",
+            "수식_셀": XLSX.utils.encode_cell({ r, c: qtyCol }),
+            "수식_일부": String(val),
+            "일치여부": status_di
+          });
+        }
+      }
+    }
+
+    const total = records.length;
+    const ok = records.filter(x => x.일치여부 === '일치').length;
+    const bad = records.filter(x => x.일치여부 === '불일치').length;
+
+    return {
+      summary: { "A_검사한_참조": checked, "A_일치": ok, "A_불일치": bad },
+      details: records
+    };
+  }
+
+  // ===== 시트명 선택 (정확/유사) =====
+  function pickSheetByName(names, target) {
+    if (names.includes(target)) return target;
+    const t = String(target).replace(/[\u3000 ]/g, '');
+    for (const n of names) {
+      if (String(n).replace(/[\u3000 ]/g, '').includes(t)) return n;
+    }
+    return target; // 못 찾으면 그대로(나중에 시트 없음 에러)
+  }
+
+  // ===== 저장: 전체/불일치/일치 =====
   function saveThreeFiles(baseName, allRows) {
-    const passRows = allRows.filter(r => r.키_일치 === 'TRUE');
-    const failRows = allRows.filter(r => r.키_일치 !== 'TRUE');
+    const passRows = allRows.filter(r => r.일치여부 === '일치');
+    const failRows = allRows.filter(r => r.일치여부 === '불일치');
 
     // 전체
     {
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(allRows)), 'A_전체');
-      XLSX.writeFile(wb, baseName + '_A_전체.xlsx');
+      XLSX.writeFile(wb, `${baseName}_일위대가 검사_전체.xlsx`);
     }
     // 불일치
     {
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(failRows)), 'A_불일치');
-      XLSX.writeFile(wb, baseName + '_A_불일치.xlsx');
+      XLSX.writeFile(wb, `${baseName}_일위대가 검사_불일치.xlsx`);
     }
     // 일치
     {
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(objectsToAOA(passRows)), 'A_일치');
-      XLSX.writeFile(wb, baseName + '_A_일치.xlsx');
+      XLSX.writeFile(wb, `${baseName}_일위대가 검사_일치.xlsx`);
     }
-  }
-
-  // ===== 오케스트레이션 =====
-  function runChecksAndSave(wb, srcFileName) {
-    const A = runCheckA(wb);
-
-    // 로그 출력 (요약 + 불일치 상세)
-    log(`[A] 총건수=${A.summary.총건수}, 일치=${A.summary.일치}, 불일치=${A.summary.불일치}`);
-    if (A.details.length === 0) {
-      log('[A] 상세 없음');
-    } else {
-      const fails = A.details.filter(d => d.키_일치 !== 'TRUE');
-      if (fails.length) {
-        log(`[A] 불일치 상세 (${Math.min(fails.length, LOG_MISMATCH_LIMIT)}개 표시 / 총 ${fails.length})`);
-        const sample = fails.slice(0, LOG_MISMATCH_LIMIT);
-        for (const d of sample) {
-          log(`- 행${d.행번호} [${d.사유}] 내=(${d.내_품명} | ${d.내_규격}) vs 대표(${d.대표시트})=(${d.대표_품명} | ${d.대표_규격})`);
-        }
-        if (fails.length > LOG_MISMATCH_LIMIT) log(`… 생략 ${fails.length - LOG_MISMATCH_LIMIT}건`);
-      } else {
-        log('[A] 불일치 없음 (전부 일치)');
-      }
-    }
-
-    // 파일 3종 저장
-    const base = srcFileName.replace(/\.[^.]+$/, '');
-    saveThreeFiles(base, A.details);
-    log('엑셀 저장 완료: _A_전체 / _A_불일치 / _A_일치');
   }
 
   // ===== 실행 =====
   async function run() {
     try {
       document.getElementById('mfLog').textContent = '';
-      log('초기화…'); await waitForXLSX();
+      await waitForXLSX();
 
       const f = document.getElementById('mfFile').files[0];
       if (!f) throw new Error('엑셀 파일을 선택하세요.');
 
-      log('파일 로딩 중…');
       const wb = await readWorkbook(f);
-      log('시트: ' + wb.SheetNames.join(', '));
+      const { summary, details } = runCheckA(wb);
 
-      runChecksAndSave(wb, f.name);
-      log('완료.');
+      // 요약만 로그
+      log(`일위대가 검사: 참조 ${summary.A_검사한_참조}건, 일치 ${summary.A_일치}, 불일치 ${summary.A_불일치}`);
+
+      const base = f.name.replace(/\.[^.]+$/, '');
+      saveThreeFiles(base, details);
+      log('엑셀 저장 완료: _일위대가 검사_전체 / _불일치 / _일치');
     } catch (e) {
-      console.error(e); log(`ERROR: ${e.message || e}\n${e.stack || ''}`);
+      console.error(e);
+      log(`ERROR: ${e.message || e}`);
     }
   }
 
@@ -257,4 +302,3 @@
     if (btn) btn.addEventListener('click', run);
   });
 })();
-
