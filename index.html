@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>검사 실행 대시보드</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    h1 { margin-bottom: 8px; }
+    fieldset { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-bottom: 24px; }
+    legend { padding: 0 8px; font-weight: 600; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button { padding: 8px 14px; border-radius: 8px; border: 1px solid #ccc; cursor: pointer; background: #fafafa; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .log { background: #0b1020; color: #d8ffe2; padding: 12px; border-radius: 8px; white-space: pre-wrap; min-height: 120px; }
+    .downloads a { display: inline-block; margin: 6px 8px 0 0; }
+    .hint { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>검사 실행</h1>
+  <p class="hint">서버 실행 후 이 페이지를 열어 사용하세요. (아래 “서버 실행 방법” 참고)</p>
+
+  <!-- Matchflag -->
+  <fieldset>
+    <legend>Matchflag 검사 (엑셀 1개)</legend>
+    <div class="row">
+      <input type="file" id="mf-file" accept=".xlsx,.xlsm,.xlsb,.xls" />
+      <button id="mf-run">실행</button>
+    </div>
+    <h3>로그</h3>
+    <div id="mf-log" class="log"></div>
+    <h3>다운로드</h3>
+    <div id="mf-dls" class="downloads"></div>
+  </fieldset>
+
+  <!-- Nb2 -->
+  <fieldset>
+    <legend>Nb2 검사 (엑셀 2개: 좌/우 비교)</legend>
+    <div class="row">
+      <label>파일 A(예: 기계): <input type="file" id="nb2-a" accept=".xlsx,.xlsm,.xlsb,.xls" /></label>
+      <label>파일 B(예: 토목): <input type="file" id="nb2-b" accept=".xlsx,.xlsm,.xlsb,.xls" /></label>
+      <button id="nb2-run">실행</button>
+    </div>
+    <h3>로그</h3>
+    <div id="nb2-log" class="log"></div>
+    <h3>다운로드</h3>
+    <div id="nb2-dls" class="downloads"></div>
+  </fieldset>
+
+  <script>
+    async function postForm(url, formData, onLog) {
+      const res = await fetch(url, { method: 'POST', body: formData });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || ('HTTP ' + res.status));
+      }
+      // JSON 응답 { ok: true, log: "...", files: [{name, url}] }
+      const data = await res.json();
+      if (data.log && onLog) onLog(data.log);
+      return data;
+    }
+
+    function renderDownloads(container, files=[]) {
+      container.innerHTML = '';
+      files.forEach(f => {
+        const a = document.createElement('a');
+        a.href = f.url;
+        a.download = f.name;
+        a.textContent = `⬇ ${f.name}`;
+        container.appendChild(a);
+      });
+      if (files.length === 0) container.textContent = '생성된 파일이 없습니다.';
+    }
+
+    // Matchflag
+    const mfRunBtn = document.getElementById('mf-run');
+    mfRunBtn.addEventListener('click', async () => {
+      const f = document.getElementById('mf-file').files[0];
+      const logBox = document.getElementById('mf-log');
+      const dlBox  = document.getElementById('mf-dls');
+      logBox.textContent = ''; dlBox.textContent = '';
+      if (!f) { logBox.textContent = '파일을 선택하세요.'; return; }
+      mfRunBtn.disabled = true;
+      try {
+        const fd = new FormData();
+        fd.append('file', f);
+        const data = await postForm('/api/matchflag', fd, (log)=>logBox.textContent = log);
+        renderDownloads(dlBox, data.files || []);
+      } catch (e) {
+        logBox.textContent = '에러: ' + e.message;
+      } finally {
+        mfRunBtn.disabled = false;
+      }
+    });
+
+    // Nb2
+    const nb2RunBtn = document.getElementById('nb2-run');
+    nb2RunBtn.addEventListener('click', async () => {
+      const a = document.getElementById('nb2-a').files[0];
+      const b = document.getElementById('nb2-b').files[0];
+      const logBox = document.getElementById('nb2-log');
+      const dlBox  = document.getElementById('nb2-dls');
+      logBox.textContent = ''; dlBox.textContent = '';
+      if (!a || !b) { logBox.textContent = '두 파일을 모두 선택하세요.'; return; }
+      nb2RunBtn.disabled = true;
+      try {
+        const fd = new FormData();
+        fd.append('mech', a);
+        fd.append('civil', b);
+        const data = await postForm('/api/nb2', fd, (log)=>logBox.textContent = log);
+        renderDownloads(dlBox, data.files || []);
+      } catch (e) {
+        logBox.textContent = '에러: ' + e.message;
+      } finally {
+        nb2RunBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
