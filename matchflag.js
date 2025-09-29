@@ -651,6 +651,64 @@
      const bad = records.filter(x=>x.일치여부==='불일치').length;
      return { summary: { "E_일치": ok, "E_불일치": bad }, details: records };
    }
+   // ===== 실행 엔트리 =====
+   async function run() {
+     try {
+       // UI 상태
+       const btn = document.getElementById('mfRun');
+       if (btn) { btn.disabled = true; btn.textContent = '실행 중...'; }
+       const logEl = document.getElementById('mfLog');
+       if (logEl) logEl.textContent = '';
+   
+       // SheetJS 로드 확인 (cdn 또는 로컬 lib/xlsx.full.min.js)
+       await waitForXLSX();
+   
+       // 파일 가져오기
+       const fileInput = document.getElementById('mfFile');
+       const f = fileInput?.files?.[0];
+       if (!f) {
+         log('엑셀 파일을 선택해 주세요.');
+         return;
+       }
+   
+       // 워크북 읽기
+       const wb = await readWorkbook(f);
+       const base = f.name.replace(/\.[^.]+$/, '');
+   
+       // 검사 실행(A~E)
+       log('검사 시작 (A~E)…');
+       const A = runCheckA(wb); await uiYield();
+       const B = runCheckB(wb); await uiYield();
+       const C = runCheckC(wb); await uiYield();
+       const D = runCheckD(wb); await uiYield();
+       const E = runCheckE(wb);
+   
+       // 요약 로그
+       log(`[A] 일치 ${A.summary.A_일치}, 불일치 ${A.summary.A_불일치}`);
+       log(`[B] 일치 ${B.summary.B_일치}, 불일치 ${B.summary.B_불일치}`);
+       log(`[C] 일치 ${C.summary.C_일치}, 불일치 ${C.summary.C_불일치}`);
+       log(`[D] 일치 ${D.summary.D_일치}, 불일치 ${D.summary.D_불일치}`);
+       log(`[E] 일치 ${E.summary.E_일치}, 불일치 ${E.summary.E_불일치}`);
+   
+       // 결과 저장 (A~E 각 3시트: 전체/불일치/일치)
+       saveAllSectionsAsOneWorkbook(base, [
+         { name: 'A', rows: A.details },
+         { name: 'B', rows: B.details },
+         { name: 'C', rows: C.details },
+         { name: 'D', rows: D.details },
+         { name: 'E', rows: E.details },
+       ]);
+   
+       log('엑셀 저장 완료: 종합검사.xlsx (A~E 각 3시트)');
+   
+     } catch (e) {
+       console.error(e);
+       log(`ERROR: ${e && e.message ? e.message : e}`);
+     } finally {
+       const btn = document.getElementById('mfRun');
+       if (btn) { btn.disabled = false; btn.textContent = '검사 실행 (A~E)'; }
+     }
+   }
 
   // ===== 실행 =====
    const base = f.name.replace(/\.[^.]+$/, '');
