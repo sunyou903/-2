@@ -1,6 +1,20 @@
+// 전역 에러 잡기 → #log에 표시
+window.onerror = function (msg, url, line, col, error) {
+  const logEl = document.getElementById("log");
+  const text = [
+    "=== 전역 에러 감지 ===",
+    "메시지: " + msg,
+    "파일: " + url,
+    "줄/컬럼: " + line + ":" + col,
+    "오브젝트: " + (error && error.stack ? error.stack : error)
+  ].join("\n");
+  logEl.textContent += (logEl.textContent ? "\n" : "") + text;
+  return false; // 콘솔에도 그대로 출력
+};
+
+
 // ===== Nb2_rev2 포팅 (브라우저) =====
 // 원본 논리 근거: HEADER 탐색/핵심컬럼 추출/가중유사도/임계값 30% 등:contentReference[oaicite:6]{index=6}
-
 const LABELS = {
   "품명": "품 명",
   "규격": "규 격",
