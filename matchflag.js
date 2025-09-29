@@ -107,9 +107,18 @@
     const t = String(nameCell);
     return t.includes('합') && t.includes('계') && t.includes('[') && t.includes(']');
   }
+  // UI에 제어권 잠깐 넘겨서 '멈춘 것처럼' 보이지 않게 함
+  function uiYield() { return new Promise(r => setTimeout(r, 0)); }
+
+  // N번째마다 진행 로그 찍기
+  function progressLog(prefix, i, total, step=200) {
+    if (i % step === 0) log(`${prefix}... ${i}/${total}`);
+  }
+
 
   // ===== 수식 참조 추출:  '단가대비표' / '일위대가목록' ! $A$123 =====
   const REF_RE = /(?:'?)((?:단가대비표)|(?:일위대가목록))(?:'?)!\$?([A-Z]{1,3})\$?(\d+)/g;
+
 
   // ===== 객체 배열→AOA =====
   function objectsToAOA(objs) {
